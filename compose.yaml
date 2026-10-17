@@ -1,0 +1,66 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: research
+      POSTGRES_USER: research
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U research -d research"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    mem_limit: 384m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  observer:
+    build: .
+    env_file: .env
+    environment:
+      APP_MODE: research
+      DATA_DIR: /app/data
+      # Build from separate fields in code via PG* rather than URI-escaping a password.
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: research
+      PGUSER: research
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      STORAGE_POSTGRES: "true"
+      WEB_HOST: "0.0.0.0"
+      ALLOW_CONTAINER_BIND: "true"
+      WEB_PORT: "4317"
+    ports:
+      - "127.0.0.1:4317:4317"
+    depends_on:
+      db: { condition: service_healthy }
+    volumes:
+      - observations:/app/data
+      - ./config:/app/config:ro
+    init: true
+    stop_grace_period: 30s
+    restart: "on-failure:3"
+    mem_limit: 768m
+    cpus: 1.0
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: [/tmp]
+    healthcheck:
+      test: ["CMD", "node", "dist/healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  pgdata:
+  observations:

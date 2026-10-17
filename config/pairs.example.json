@@ -1,0 +1,17 @@
+[
+  {
+    "polymarketSlug": "replace-with-exact-polymarket-slug",
+    "limitlessSlug": "replace-with-exact-limitless-slug",
+    "polymarketRulesHash": "copy-from-data-candidates-latest-json",
+    "limitlessRulesHash": "copy-from-data-candidates-latest-json",
+    "reviewedBy": "your-name",
+    "reviewedAt": "2026-10-16T00:00:00Z",
+    "validUntil": "2026-10-17T00:00:00Z",
+    "samePositiveOutcome": true,
+    "resolutionSourceChecked": true,
+    "observationTimeChecked": true,
+    "thresholdAndEqualityChecked": true,
+    "cancellationRulesChecked": true,
+    "notes": "Explain why payouts are complementary, including oracle and fallback rules."
+  }
+]
