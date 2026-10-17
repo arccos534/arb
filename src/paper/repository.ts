@@ -4,6 +4,38 @@ import path from 'node:path';
 import { Decimal } from 'decimal.js';
 import { paperSettingsSchema, type PaperState, type Source } from './types.js';
 import { initialState } from './engine.js';
+import { atomicWriteFile } from '../atomic-file.js';
+import { profiler } from '../profiling.js';
+
+type SavedState = Record<string, unknown>;
+interface PatchRecord { schemaVersion: 2; sequence: number; baseSequence: number; sessionId: string; set: SavedState; arrays: Record<string, { length: number; items: [number, unknown][] }> }
+function applyRecord(value: unknown, current: PaperState | null, source: Source): PaperState {
+  if (!value || typeof value !== 'object') throw new Error('Invalid transaction');
+  const record = value as { state?: PaperState } & Partial<PatchRecord>;
+  if (record.state) return !current || record.state.sessionId !== current.sessionId || record.state.sequence > current.sequence ? validateState(record.state, source) : current;
+  if (record.schemaVersion !== 2 || !Number.isSafeInteger(record.sequence)) throw new Error('Unknown transaction format');
+  if (current && record.sequence! <= current.sequence) return current;
+  if (!current || record.baseSequence !== current.sequence || record.sequence !== current.sequence + 1 || record.sessionId !== current.sessionId) throw new Error('Transaction sequence/session gap');
+  if (!record.set || !record.arrays || typeof record.set !== 'object' || typeof record.arrays !== 'object') throw new Error('Invalid transaction patch');
+  const next = { ...current } as unknown as SavedState;
+  for (const [key, field] of Object.entries(record.set)) {
+    if (!Object.hasOwn(current, key) && key !== 'entryDiagnostics') throw new Error('Unknown state field');
+    if (['__proto__', 'constructor', 'prototype'].includes(key)) throw new Error('Invalid state field');
+    next[key] = field;
+  }
+  for (const [key, change] of Object.entries(record.arrays)) {
+    if (!Object.hasOwn(current, key) || !Array.isArray(next[key]) || !Number.isSafeInteger(change.length) || change.length < 0 || !Array.isArray(change.items)) throw new Error('Invalid array patch');
+    const rows = (next[key] as unknown[]).slice(0, change.length);
+    for (const [index, item] of change.items) {
+      if (!Number.isSafeInteger(index) || index < 0 || index >= change.length) throw new Error('Invalid array index');
+      rows[index] = item;
+    }
+    if (rows.length !== change.length || Array.from({ length: rows.length }, (_, i) => i).some(i => !Object.hasOwn(rows, i))) throw new Error('Incomplete array patch');
+    next[key] = rows;
+  }
+  if (next.sequence !== record.sequence || next.sessionId !== current.sessionId || next.source !== source || next.version !== current.version) throw new Error('Invalid patched state identity');
+  return validateState(next, source);
+}
 
 export function validateState(value: unknown, source: Source): PaperState {
   const state = value as PaperState;
@@ -21,6 +53,9 @@ export function validateState(value: unknown, source: Source): PaperState {
 
 export class PaperRepository {
   readonly directory: string;
+  private previous: SavedState | undefined;
+  private walBytes = 0;
+  private failure: unknown;
   constructor(directory: string, readonly source: Source, private readonly rotationBytes = 16 * 1024 ** 2) { this.directory = path.resolve(directory); }
   private get wal(): string { return path.join(this.directory, 'transactions.jsonl'); }
   async open(): Promise<PaperState> {
@@ -40,8 +75,7 @@ export class PaperRepository {
       let goodBytes = 0, pending = '';
       const recover = (line: string) => {
         if (!line.trim()) return;
-          const transaction = JSON.parse(line) as { state: PaperState };
-          if (!state || transaction.state.sequence > state.sequence) state = validateState(transaction.state, this.source);
+          state = applyRecord(JSON.parse(line), state, this.source);
       };
       for await (const chunk of createReadStream(journal, { encoding: 'utf8' })) {
         pending += chunk;
@@ -65,28 +99,49 @@ export class PaperRepository {
     if (!state) state = initialState(this.source);
     state.running = false;
     await this.checkpoint(state);
+    try { this.walBytes = (await stat(this.wal)).size; } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
+    this.previous = undefined;
     return state;
   }
   async commit(state: PaperState, events: unknown[]): Promise<void> {
+    if (this.failure) throw new Error(`Repository halted after a write failure; reopen and recover before writing: ${String(this.failure)}`);
+    try {
     state.sequence++;
-    let size = 0;
-    try { size = (await stat(this.wal)).size; } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
-    const line = JSON.stringify({ sequence: state.sequence, at: new Date().toISOString(), events, state }) + '\n';
-    if (size + Buffer.byteLength(line) > 256 * 1024 ** 2) throw new Error('Paper transaction journal reached 256 MB; archive session before continuing');
-    await appendFile(this.wal, line, { mode: 0o600, flush: true });
-    await this.checkpoint(state);
+    const snapshot = JSON.parse(JSON.stringify(state)) as SavedState;
+    let transaction: unknown = { sequence: state.sequence, at: new Date().toISOString(), events, state: snapshot };
+    const previous = this.previous;
+    if (previous && previous.sessionId === state.sessionId && Object.keys(previous).every(key => Object.hasOwn(snapshot, key))) {
+      const set: SavedState = {}, arrays: PatchRecord['arrays'] = {};
+      for (const [key, value] of Object.entries(snapshot)) {
+        const old = previous[key];
+        if (Array.isArray(value) && Array.isArray(old)) {
+          const items: [number, unknown][] = [];
+          value.forEach((item, i) => { if (JSON.stringify(item) !== JSON.stringify(old[i])) items.push([i, item]); });
+          if (value.length !== old.length || items.length) arrays[key] = { length: value.length, items };
+        } else if (JSON.stringify(value) !== JSON.stringify(old)) set[key] = value;
+      }
+      transaction = { schemaVersion: 2, sequence: state.sequence, baseSequence: previous.sequence, sessionId: state.sessionId, set, arrays, events };
+    }
+    const line = JSON.stringify(transaction) + '\n', bytes = Buffer.byteLength(line);
+    if (this.walBytes + bytes > 256 * 1024 ** 2) throw new Error('Paper transaction journal reached 256 MB; archive session before continuing');
+    const started = profiler.start();
+    try { await appendFile(this.wal, line, { mode: 0o600, flush: true }); } finally { profiler.end('wal', started); }
+    this.previous = snapshot; this.walBytes += bytes;
     // Rotate only after the committed state has a complete atomic checkpoint.
     // Recovery reads the active WAL; older history stays available separately.
-    if (size + Buffer.byteLength(line) >= this.rotationBytes) {
+    if (this.walBytes >= this.rotationBytes) {
+      await this.checkpoint(state);
       const archive = path.join(this.directory, 'transactions-archive'); await mkdir(archive, { recursive: true });
       await rename(this.wal, path.join(archive, `transactions-${state.sequence}-${Date.now()}.jsonl`));
+      this.previous = undefined; this.walBytes = 0;
     }
+    } catch (error) { this.failure = error; throw error; }
   }
   async checkpoint(state: PaperState): Promise<void> {
-    const file = path.join(this.directory, 'state.json');
-    const tmp = `${file}.${process.pid}.tmp`;
-    await writeFile(tmp, JSON.stringify(state), { mode: 0o600, flush: true });
-    await rename(tmp, file);
+    if (this.failure) throw new Error('Repository halted; checkpoint would overwrite recovery evidence');
+    const started = profiler.start();
+    try { await atomicWriteFile(path.join(this.directory, 'state.json'), JSON.stringify(state), true); }
+    finally { profiler.end('checkpoint', started); }
   }
   async archive(state: PaperState): Promise<void> {
     await mkdir(path.join(this.directory, 'sessions'), { recursive: true });

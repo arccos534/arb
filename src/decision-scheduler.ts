@@ -12,13 +12,15 @@ export class DecisionScheduler {
   private stopped = false;
   private queuedAt = 0;
   private queuedMono = 0;
+  private receiptMono: number | undefined;
   readonly stats = { decisions: 0, lastDispatchLagMs: 0, maxDispatchLagMs: 0 };
-  constructor(private readonly decide: (pairs: ReadonlySet<string> | undefined) => Promise<void>,
+  constructor(private readonly decide: (pairs: ReadonlySet<string> | undefined, receiptMono?: number) => Promise<void>,
     private readonly onError: (error: unknown) => void, private readonly coalesceMs = 5) {}
-  request(pairs?: Iterable<string>): void {
+  request(pairs?: Iterable<string>, receiptMono?: number): void {
     if (this.stopped) return;
     if (!this.pending) { this.queuedAt = Date.now(); this.queuedMono = profiler.start(); }
     this.pending = true;
+    if (receiptMono !== undefined && receiptMono > 0) this.receiptMono = Math.min(this.receiptMono ?? receiptMono, receiptMono);
     if (pairs === undefined) this.full = true;
     else for (const id of pairs) this.pairs.add(id);
     this.schedule();
@@ -40,12 +42,14 @@ export class DecisionScheduler {
   private flush(): void {
     if (this.stopped || !this.pending || this.task) return;
     const pairs = this.full ? undefined : new Set(this.pairs);
+    const receiptMono = this.receiptMono; this.receiptMono = undefined;
     this.pending = false; this.full = false; this.pairs.clear();
     this.stats.lastDispatchLagMs = Math.max(0, Date.now() - this.queuedAt);
     this.stats.maxDispatchLagMs = Math.max(this.stats.maxDispatchLagMs, this.stats.lastDispatchLagMs);
     this.stats.decisions++;
     profiler.end('decision-queue', this.queuedMono);
-    this.task = Promise.resolve().then(() => this.decide(pairs)).catch(this.onError).finally(() => {
+    this.task = Promise.resolve().then(() => this.decide(pairs, receiptMono)).catch(this.onError).finally(() => {
+      if (receiptMono !== undefined) profiler.end('decision-complete', receiptMono);
       this.task = undefined; this.schedule();
     });
   }

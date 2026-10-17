@@ -14,6 +14,7 @@ COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node config ./config
 COPY --chown=node:node web ./web
+COPY --chown=node:node scripts/market-database-worker.mjs ./scripts/market-database-worker.mjs
 RUN mkdir /app/data && chown node:node /app/data
 USER node
 CMD ["node", "dist/server.js"]

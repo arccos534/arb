@@ -2,20 +2,20 @@ import { profiler } from './profiling.js';
 import { Decimal } from 'decimal.js';
 import type { Book, Level, Market, Outcome } from './domain.js';
 import { array, record } from './http.js';
+import { certifyLevels, sortLevels } from './book-levels.js';
 
-function levels(value: unknown, rawUnits: boolean, invert = false): Level[] {
-  return array(value).map(v => {
+function levels(value: unknown, rawUnits: boolean): Level[] {
+  const result: Level[] = [];
+  for (const v of array(value)) {
     const row = record(v);
     const price = new Decimal(String(row.price));
-    const shares = new Decimal(String(row.size)).div(rawUnits ? 1000000 : 1);
+    const size = new Decimal(String(row.size));
+    const shares = rawUnits ? size.div(1000000) : size;
     if (!price.isFinite() || !shares.isFinite() || price.lte(0) || price.gte(1) || shares.lt(0)) throw new Error('Invalid order-book level');
-    if (rawUnits && !new Decimal(String(row.size)).isInteger()) throw new Error('Non-integer raw size');
-    return { price: (invert ? new Decimal(1).minus(price) : price).toString(), shares: shares.toString() };
-  }).filter(v => new Decimal(v.shares).gt(0));
-}
-
-function sort(values: Level[], asc: boolean): Level[] {
-  return values.sort((a, b) => new Decimal(a.price).comparedTo(b.price) * (asc ? 1 : -1));
+    if (rawUnits && !size.isInteger()) throw new Error('Non-integer raw size');
+    if (shares.gt(0)) result.push({ price: price.toString(), shares: shares.toString() });
+  }
+  return result;
 }
 
 export function timestamp(value: unknown): number | null {
@@ -34,7 +34,7 @@ export function polyBook(value: unknown, market: Market, outcome: Outcome, trans
   if (minimum !== null && (!new Decimal(minimum).isFinite() || new Decimal(minimum).lt(0))) throw new Error('Invalid minimum');
   return {
     venue: 'polymarket', slug: market.slug, outcome, assetId: expectedId,
-    asks: sort(levels(raw.asks, false), true), bids: sort(levels(raw.bids, false), false),
+    asks: sortLevels(levels(raw.asks, false), true), bids: sortLevels(levels(raw.bids, false), false),
     receivedAt: now, sourceTimestamp: timestamp(raw.timestamp), transport, tickSize: tick, minOrderShares: minimum,
   };
 }
@@ -43,10 +43,12 @@ export function limitlessBooks(value: unknown, market: Market, transport: Book['
   const raw = record(value);
   if (raw.tokenId !== undefined && String(raw.tokenId) !== market.yesToken) throw new Error('Limitless book asset mismatch');
   const base = { venue: 'limitless' as const, slug: market.slug, receivedAt: now, sourceTimestamp: timestamp(sourceTime), transport, tickSize: null, minOrderShares: null };
+  const asks = sortLevels(levels(raw.asks, true), true), bids = sortLevels(levels(raw.bids, true), false);
+  const mirror = (rows: Level[], asc: boolean) => certifyLevels(rows.map(row => ({ price: new Decimal(1).minus(row.price).toString(), shares: row.shares })), asc);
   // minSize is the LP rewards threshold, NOT the minimum executable order size.
   return [
-    { ...base, outcome: 'yes', assetId: market.yesToken, asks: sort(levels(raw.asks, true), true), bids: sort(levels(raw.bids, true), false) },
-    { ...base, outcome: 'no', assetId: market.noToken, asks: sort(levels(raw.bids, true, true), true), bids: sort(levels(raw.asks, true, true), false) },
+    { ...base, outcome: 'yes', assetId: market.yesToken, asks, bids },
+    { ...base, outcome: 'no', assetId: market.noToken, asks: mirror(bids, true), bids: mirror(asks, false) },
   ];
 }
 
@@ -56,7 +58,10 @@ export function bookKey(venue: string, slug: string, outcome: string): string {
 
 export class BookCache {
   private readonly books = new Map<string, Book>();
-  constructor(private readonly onUpdate?: (book: Book) => void, private readonly onInvalidate?: (key: string) => void) {}
+  private readonly removed = new Set<string>();
+  constructor(private readonly onUpdate?: (book: Book) => void, private readonly onInvalidate?: (key: string) => void, private readonly parent?: BookCache) {}
+  get size(): number { return this.books.size; }
+  fork(): BookCache { return new BookCache(undefined, undefined, this); }
   set(book: Book): void {
     const profileStart = profiler.start();
     try {
@@ -65,12 +70,21 @@ export class BookCache {
     if (previous && previous.receivedAt > book.receivedAt) return;
     if (previous?.sourceTimestamp && book.sourceTimestamp && previous.sourceTimestamp > book.sourceTimestamp) return;
     this.books.set(key, book);
+    this.removed.delete(key);
     this.onUpdate?.(book);
     } finally { profiler.end('book-update', profileStart); }
   }
-  get(venue: string, slug: string, outcome: string): Book | undefined { return this.books.get(bookKey(venue, slug, outcome)); }
+  get(venue: string, slug: string, outcome: string): Book | undefined {
+    const key = bookKey(venue, slug, outcome);
+    let book = this.books.get(key);
+    if (!book && this.parent && !this.removed.has(key)) {
+      const original = this.parent.get(venue, slug, outcome);
+      if (original) { book = { ...original }; this.books.set(key, book); }
+    }
+    return book;
+  }
   delete(venue: string, slug: string, outcome: string): void { this.remove(bookKey(venue, slug, outcome)); }
-  private remove(key: string): void { if (this.books.delete(key)) this.onInvalidate?.(key); }
+  private remove(key: string): void { if (this.parent) this.removed.add(key); if (this.books.delete(key)) this.onInvalidate?.(key); }
   clearVenue(venue: string): void {
     for (const [key, book] of this.books) if (book.venue === venue) this.remove(key);
   }

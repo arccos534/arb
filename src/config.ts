@@ -16,6 +16,7 @@ const schema = z.object({
   MAX_PAGES: z.coerce.number().int().min(0).default(0),
   MAX_WATCH_PAIRS: z.coerce.number().int().min(0).default(0),
   REQUEST_TIMEOUT_MS: positive.int().default(10000),
+  MIN_HTTP_INTERVAL_MS: z.coerce.number().int().min(25).max(5000).default(100),
   MAX_BOOK_AGE_MS: positive.int().default(2000),
   MAX_BOOK_SKEW_MS: positive.int().default(750),
   TARGET_NET_SHARES: decimal.default('10').refine(v => Number(v) > 0),

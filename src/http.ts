@@ -1,6 +1,9 @@
 import { profiler } from './profiling.js';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
+import { RequestLimiter } from './request-limiter.js';
+
+const limiters = new Map<string, RequestLimiter>();
 
 export interface RequestMetric {
   url: string;
@@ -19,24 +22,35 @@ export class HttpError extends Error {
 // GET only. No signing, proxying, credentials, or trading endpoints in this stage.
 export class PublicHttp {
   readonly metrics: RequestMetric[] = [];
-  constructor(private readonly timeoutMs: number, private readonly diagnostic?: (category: string, payload: unknown) => void) {}
-
-  async get(url: string): Promise<unknown> {
-    return JSON.parse(await this.getText(url));
+  constructor(private readonly timeoutMs: number, private readonly diagnostic?: (category: string, payload: unknown) => void, private readonly intervalMs = 100) {}
+  private limiter(url: string): RequestLimiter {
+    const origin = new URL(url).origin;
+    let limiter = limiters.get(origin);
+    if (!limiter) { limiter = new RequestLimiter(this.intervalMs); limiters.set(origin, limiter); }
+    return limiter;
   }
 
-  async getText(url: string): Promise<string> {
+  async get(url: string, urgent = false, onStart?: () => void): Promise<unknown> {
+    const body = await this.getText(url, urgent, onStart);
+    return profiler.measure('json-decode', () => JSON.parse(body));
+  }
+
+  async getText(url: string, urgent = false, onStart?: () => void): Promise<string> {
     for (let attempt = 0; ; attempt++) {
-      try { return await this.getTextOnce(url); }
+      try { return await this.getTextOnce(url, urgent, onStart); }
       catch (error) {
         const retryable = error instanceof HttpError ? error.status === 429 || error.status >= 500 : error instanceof TypeError || (error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name));
         if (!retryable || attempt >= 2) throw error;
-        await delay(error instanceof HttpError && error.retryAfterMs !== null ? error.retryAfterMs : 1000 * (attempt + 1));
+        const wait = error instanceof HttpError && error.retryAfterMs !== null ? error.retryAfterMs : 1000 * 2 ** attempt + Math.random() * 250;
+        if (error instanceof HttpError && (error.status === 429 || error.status === 503)) this.limiter(url).cooldown(wait);
+        await delay(wait);
       }
     }
   }
 
-  private async getTextOnce(url: string): Promise<string> {
+  private async getTextOnce(url: string, urgent: boolean, onStart?: () => void): Promise<string> {
+    const queued = profiler.start(); await this.limiter(url).wait(urgent); profiler.end('rate-limit', queued);
+    onStart?.();
     const started = performance.now();
     let status: number | null = null;
     let ok = false;

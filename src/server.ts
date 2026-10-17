@@ -11,6 +11,7 @@ import { Application } from './application.js';
 import { executionReport } from './diagnostics/report.js';
 import { diagnosticsCsv } from './diagnostics/execution.js';
 import type { Source } from './paper/types.js';
+import { JsonViewCache } from './view-cache.js';
 
 const commandSchema = z.object({
   source: z.enum(['live', 'demo']), action: z.enum(['start', 'pause', 'reset', 'rebalance', 'close', 'close-all', 'settings', 'demo', 'review-mode']),
@@ -42,6 +43,8 @@ export async function startServer(options: { config?: Config; port?: number; sta
   const config = options.config ?? loadConfig();
   const app = new Application(config);
   const token = randomBytes(24).toString('hex');
+  const views = new JsonViewCache();
+  const streams = new Set<{ response:ServerResponse; timer:NodeJS.Timeout }>();
   const port = options.port ?? Number(process.env.WEB_PORT ?? 4317);
   const bindHost = process.env.WEB_HOST === '0.0.0.0' && process.env.ALLOW_CONTAINER_BIND === 'true' ? '0.0.0.0' : '127.0.0.1';
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid WEB_PORT');
@@ -93,7 +96,24 @@ export async function startServer(options: { config?: Config; port?: number; sta
       }
       if (request.method !== 'GET') { json(response, 405, { error: 'Method not allowed' }); return; }
       const source = z.enum(['live', 'demo']).parse(url.searchParams.get('source') ?? 'live') as Source;
-      if (url.pathname === '/api/state') { json(response, 200, { csrf: token, ...await app.view(source) as object }); return; }
+      const marketQuery={filter:z.enum(['all','reviewed','watching','strategy']).parse(url.searchParams.get('filter')??'all'),search:z.string().max(200).parse(url.searchParams.get('search')??'')};
+      if(url.pathname==='/api/markets'){json(response,200,await app.markets(marketQuery));return;}
+      if(url.pathname==='/api/markets/stream'){
+        response.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-store','connection':'keep-alive','x-accel-buffering':'no'});response.flushHeaders();
+        let busy=false;
+        const send=async()=>{if(busy||response.destroyed||closing)return;busy=true;try{
+          const result=await app.markets(marketQuery);if(!response.destroyed){if(response.writableLength>262144){response.end();return;}response.write(`data: ${JSON.stringify(result)}\n\n`);}
+        }catch(error){if(!response.destroyed)response.write(`event: warning\ndata: ${JSON.stringify({error:String(error)})}\n\n`);}finally{busy=false;}};
+        const client={response,timer:setInterval(()=>void send(),500)};streams.add(client);
+        response.once('close',()=>{clearInterval(client.timer);streams.delete(client);});void send();return;
+      }
+      if (url.pathname === '/api/state') {
+        const encoded = await views.get(`${source}:${marketQuery.filter}:${marketQuery.search}`, async () => {
+          const started = profiler.start();
+          try { return { csrf: token, ...await app.view(source,marketQuery) as object }; } finally { profiler.end('ui', started); }
+        });
+        response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); response.end(encoded); return;
+      }
       if (url.pathname === '/api/diagnostics/profile') { json(response, 200, profiler.report()); return; }
       if (url.pathname === '/api/diagnostics/execution') {
         const report = await executionReport(app.dataDir);
@@ -126,9 +146,12 @@ export async function startServer(options: { config?: Config; port?: number; sta
         response.writeHead(200, { 'content-type': 'application/gzip', 'content-length': contents.length, 'content-disposition': `attachment; filename="${name}"` });
         response.end(contents); return;
       }
-      if (url.pathname === '/api/health') { json(response, 200, { ok: opened, paperOnly: true, auditError: app.audit.error }); return; }
+      if (url.pathname === '/api/health') { json(response, 200, { ok: opened && !closing, paperOnly: true, pid: process.pid, dataDir: app.dataDir, auditError: app.audit.error,
+        observerError: app.observerError, feed: app.observer?.liveHealth() ?? null,
+        sessions: Object.fromEntries((['live', 'demo'] as const).map(s => [s, { running: app.engines[s].state.running, sessionId: app.engines[s].state.sessionId }])) }); return; }
       const files: Record<string, { name: string; mime: string }> = {
         '/': { name: 'index.html', mime: 'text/html; charset=utf-8' }, '/app.js': { name: 'app.js', mime: 'text/javascript; charset=utf-8' }, '/style.css': { name: 'style.css', mime: 'text/css; charset=utf-8' },
+        '/theme.js':{name:'theme.js',mime:'text/javascript; charset=utf-8'},'/theme.css':{name:'theme.css',mime:'text/css; charset=utf-8'},
       };
       const file = files[url.pathname];
       if (!file) { json(response, 404, { error: 'Not found' }); return; }
@@ -138,13 +161,14 @@ export async function startServer(options: { config?: Config; port?: number; sta
       if (!response.headersSent) json(response, e instanceof z.ZodError || e instanceof SyntaxError ? 400 : 409, { error: e instanceof Error ? e.message : String(e) });
       else response.end();
     } finally {
-      if (request.method === 'POST') app.audit.record('ui-command', 'system', { method: request.method, path: url.pathname, status: response.statusCode, durationMs: Date.now() - began });
+      if (request.method === 'POST') { views.invalidate(); app.audit.record('ui-command', 'system', { method: request.method, path: url.pathname, status: response.statusCode, durationMs: Date.now() - began }); }
     }
   });
   try {
     await app.open(options.startObserver ?? process.env.OBSERVER_AUTOSTART !== 'false'); opened = true;
     await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, bindHost, () => resolve()); });
     localUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    profiler.startRuntime();
   } catch (e) {
     if (opened) await app.close();
     if (options.lock !== false) await unlink(lockPath).catch(() => {});
@@ -152,8 +176,9 @@ export async function startServer(options: { config?: Config; port?: number; sta
   }
   const close = async () => {
     if (closing) return; closing = true;
+    for(const client of streams){clearInterval(client.timer);client.response.end();}streams.clear();
     await new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); });
-    await app.close(); if (options.lock !== false) await unlink(lockPath).catch(() => {});
+    await app.close(); profiler.stopRuntime(); if (options.lock !== false) await unlink(lockPath).catch(() => {});
   };
   return { url: localUrl, app, close };
 }

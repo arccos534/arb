@@ -5,6 +5,7 @@ dist/
 !.env.example
 data/
 archives/
+backups/
 coverage/
 *.log
 *.pem

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile, appendFile, readdir } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile, appendFile, readdir, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { gunzipSync } from 'node:zlib';
@@ -11,6 +11,41 @@ const directories:string[]=[];
 async function directory(){const dir=await mkdtemp(path.join(tmpdir(),'paper-mvp-'));directories.push(dir);return dir;}
 afterEach(async()=>{for(const dir of directories.splice(0))await rm(dir,{recursive:true,force:true});});
 describe('paper persistence',()=>{
+  it('refuses further writes after an I/O failure until explicit recovery',async()=>{
+    const dir=await directory(),repo=new PaperRepository(dir,'live'),state=await repo.open();
+    await mkdir(path.join(dir,'transactions.jsonl'));
+    await expect(repo.commit(state,[])).rejects.toThrow();
+    await rm(path.join(dir,'transactions.jsonl'),{recursive:true});
+    await expect(repo.commit(state,[])).rejects.toThrow('Repository halted');
+    await expect(repo.checkpoint(state)).rejects.toThrow('recovery evidence');
+    const recovered=await new PaperRepository(dir,'live').open();expect(recovered.sequence).toBe(0);
+  });
+  it('recovers compact updates and array edits after a crash before checkpointing',async()=>{
+    const dir=await directory(),repo=new PaperRepository(dir,'live'),state=await repo.open();
+    state.events=[{id:'one',at:1,type:'test',tradeId:null,message:'original',details:{large:'x'.repeat(10000)}}];
+    await repo.commit(state,[]);
+    state.cash.polymarket='102';state.events[0]!.message='updated';state.equity.push({at:2,equity:'202',cash:'202',realized:'2',unrealized:'0'});
+    await repo.commit(state,[]);
+    state.cash.polymarket='103';await repo.commit(state,[]);
+    const lines=(await readFile(path.join(dir,'transactions.jsonl'),'utf8')).trim().split('\n');
+    expect(JSON.parse(lines[1]!).schemaVersion).toBe(2);expect(lines[2]!.length).toBeLessThan(lines[0]!.length/10);
+    expect(JSON.parse(await readFile(path.join(dir,'state.json'),'utf8')).sequence).toBe(0);
+    const restored=await new PaperRepository(dir,'live').open();
+    expect(restored.sequence).toBe(3);expect(restored.cash.polymarket).toBe('103');expect(restored.events[0]!.message).toBe('updated');expect(restored.equity.at(-1)!.equity).toBe('202');
+  });
+  it('rejects a missing compact transaction instead of silently skipping balances',async()=>{
+    const dir=await directory(),repo=new PaperRepository(dir,'live'),state=await repo.open();
+    await repo.commit(state,[]);state.cash.polymarket='101';await repo.commit(state,[]);state.cash.polymarket='102';await repo.commit(state,[]);
+    const file=path.join(dir,'transactions.jsonl'),lines=(await readFile(file,'utf8')).trim().split('\n');
+    await writeFile(file,lines[0]+'\n'+lines[2]+'\n');
+    await expect(new PaperRepository(dir,'live').open()).rejects.toThrow('sequence/session gap');
+  });
+  it('restores a new session even when its sequence is lower than the old session',async()=>{
+    const dir=await directory(),repo=new PaperRepository(dir,'live'),state=await repo.open();
+    state.sequence=50;await repo.commit(state,[]);
+    state.sessionId='new-session';state.sequence=0;state.cash.polymarket='100';await repo.commit(state,[]);
+    const restored=await new PaperRepository(dir,'live').open();expect(restored.sessionId).toBe('new-session');expect(restored.sequence).toBe(1);
+  });
   it('rotates a committed WAL after checkpointing and recovers without scanning the archived history',async()=>{
     const dir=await directory(),repo=new PaperRepository(dir,'live',1),state=await repo.open();
     state.cash.polymarket='103';state.realizedPnl='3';await repo.commit(state,[]);

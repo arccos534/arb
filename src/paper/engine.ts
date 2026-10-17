@@ -7,6 +7,7 @@ import { evaluate, quoteBuy } from '../engine.js';
 import { limitlessFeeRate } from '../limitless-fees.js';
 import { identityBlockers } from '../matching.js';
 import { EvaluationCache } from '../evaluation-cache.js';
+import { orderedLevels } from '../book-levels.js';
 import type { Config } from '../config.js';
 import { paperSettingsSchema, type DemoScenario, type FeedSnapshot, type PaperEvent, type PaperOrder, type PaperSettings, type PaperState, type PaperTrade, type Resolution, type Source } from './types.js';
 
@@ -27,7 +28,7 @@ export function quoteSell(book: Book | undefined, held: string, fee: FeeModel): 
   if (!book || fee.kind === 'unknown') return { shares: '0', proceeds: '0', fee: '0', levels: [] };
   let remaining = D(held), proceeds = D(0), fees = D(0);
   const levels: unknown[] = [];
-  for (const level of [...book.bids].sort((a, b) => D(b.price).comparedTo(a.price))) {
+  for (const level of orderedLevels(book.bids, false)) {
     const quantity = Decimal.min(remaining, level.shares);
     if (quantity.lte(0)) continue;
     const price = D(level.price), gross = quantity.mul(price);
@@ -110,6 +111,7 @@ export class PaperEngine {
   private exposure(): Decimal { return this.state.trades.filter(active).reduce((sum, t) => sum.plus(t.orders.reduce((s, o) => s.plus(o.costBasis).plus(o.reserve), D(0))), D(0)); }
   private random(): number { let x = this.state.rng; x ^= x << 13; x ^= x >>> 17; x ^= x << 5; this.state.rng = x >>> 0; return this.state.rng / 4294967296; }
   private cache(feed: FeedSnapshot): BookCache {
+    if (feed.bookCache) return feed.bookCache.fork();
     const cache = new BookCache();
     // Executions replace asks arrays; levels themselves remain read-only. Copy
     // just book wrappers, so fake depth consumption never changes the live feed.

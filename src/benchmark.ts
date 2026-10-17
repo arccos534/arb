@@ -10,7 +10,7 @@ export function percentile(values: number[], p: number): number | null {
 }
 
 export async function benchmark(config: Config, samples: number): Promise<unknown> {
-  const http = new PublicHttp(config.REQUEST_TIMEOUT_MS);
+  const http = new PublicHttp(config.REQUEST_TIMEOUT_MS, undefined, config.MIN_HTTP_INTERVAL_MS);
   const urls = [
     'https://gamma-api.polymarket.com/markets?limit=1&closed=false',
     'https://clob.polymarket.com/time',

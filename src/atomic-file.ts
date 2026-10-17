@@ -7,10 +7,10 @@ import { setTimeout as delay } from 'node:timers/promises';
 const replacementDelays = [10, 20, 40, 80, 160, 250, 250, 250, 250, 250, 250];
 const transientCodes = new Set(['EPERM', 'EACCES', 'EBUSY']);
 
-export async function atomicWriteFile(filename: string, contents: string): Promise<void> {
+export async function atomicWriteFile(filename: string, contents: string, durable = false): Promise<void> {
   const temporary = `${filename}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    await writeFile(temporary, contents, { mode: 0o600 });
+    await writeFile(temporary, contents, { mode: 0o600, flush: durable });
     for (let attempt = 0; ; attempt++) {
       try { await rename(temporary, filename); return; }
       catch (error) {

@@ -3,7 +3,6 @@ import type { Book, Market, Outcome } from './domain.js';
 import { PublicHttp, array, record, mapLimit } from './http.js';
 import { inHorizon, limitlessMarket, polyMarket } from './markets.js';
 import { limitlessBooks, polyBook } from './books.js';
-import { setTimeout as delay } from 'node:timers/promises';
 
 export const endpoints = {
   gamma: 'https://gamma-api.polymarket.com',
@@ -69,7 +68,6 @@ export class PublicAdapters {
     const seenPages = new Set<string>();
     for (let page = 1; this.config.MAX_PAGES === 0 || page <= this.config.MAX_PAGES; page++) {
       if (this.stopped()) throw new Error('Discovery stopped');
-      if (page > 1) await delay(1000);
       if (this.stopped()) throw new Error('Discovery stopped');
       const body = record(await this.http.get(`${endpoints.limitless}/markets/active?limit=25&page=${page}&sortBy=ending_soon`));
       const rows = array(body.data);
@@ -127,17 +125,17 @@ export class PublicAdapters {
     return { markets: [...known.values()], errors };
   }
 
-  async polyBook(market: Market, outcome: Outcome): Promise<Book> {
+  async polyBook(market: Market, outcome: Outcome, urgent = false): Promise<Book> {
     const id = outcome === 'yes' ? market.yesToken : market.noToken;
-    const startedAt = Date.now();
-    const body = await this.http.get(`${endpoints.clob}/book?${new URLSearchParams({ token_id: id })}`);
+    let startedAt = Date.now();
+    const body = await this.http.get(`${endpoints.clob}/book?${new URLSearchParams({ token_id: id })}`, urgent, () => { startedAt = Date.now(); });
     // Request start is a conservative freshness bound; arrival alone hides a slow response.
     return polyBook(body, market, outcome, 'rest', startedAt);
   }
 
-  async limitlessBooks(market: Market): Promise<Book[]> {
-    const startedAt = Date.now();
-    const body = await this.http.get(`${endpoints.limitless}/markets/${encodeURIComponent(market.slug)}/orderbook`);
+  async limitlessBooks(market: Market, urgent = false): Promise<Book[]> {
+    let startedAt = Date.now();
+    const body = await this.http.get(`${endpoints.limitless}/markets/${encodeURIComponent(market.slug)}/orderbook`, urgent, () => { startedAt = Date.now(); });
     return limitlessBooks(body, market, 'rest', startedAt);
   }
 }

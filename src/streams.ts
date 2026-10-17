@@ -6,8 +6,10 @@ import type { Book, Market } from './domain.js';
 import { BookCache, limitlessBooks, polyBook, timestamp } from './books.js';
 import { array, record } from './http.js';
 import { StreamQueue } from './stream-queue.js';
+import { certifyLevels } from './book-levels.js';
+import { profiler } from './profiling.js';
 
-export interface StreamHealth { connected: boolean; frames: number; parseErrors: number; reconnects: number; lastFrameAt: string | null }
+export interface StreamHealth { connected: boolean; frames: number; parseErrors: number; reconnects: number; lastFrameAt: string | null; pending?: number; maxPending?: number; oldestMs?: number; processed?: number }
 
 export class PolyStreamState {
   private readonly snapshots = new Map<string, Book>();
@@ -20,24 +22,27 @@ export class PolyStreamState {
     ]));
   }
 
-  apply(message: unknown, now = Date.now()): void {
-    if (Array.isArray(message)) { message.forEach(m => this.apply(m, now)); return; }
+  apply(message: unknown, now = Date.now(), receivedMono?: number): void {
+    if (Array.isArray(message)) { message.forEach(m => this.apply(m, now, receivedMono)); return; }
     const raw = record(message);
     const type = raw.event_type;
     if (type === 'price_change') {
       // Apply all deltas for an asset before publishing the resulting book.
       const changed = new Map<string, Book>();
+      const copiedSides = new Set<string>(), newTime = timestamp(raw.timestamp);
       for (const item of array(raw.price_changes)) {
         const change = record(item), id = String(change.asset_id);
-        const snapshot = changed.get(id) ?? this.snapshots.get(id);
-        if (!snapshot) continue;
-        const oldTime = snapshot.sourceTimestamp, newTime = timestamp(raw.timestamp);
+        const previous = changed.get(id) ?? this.snapshots.get(id);
+        if (!previous) continue;
+        const oldTime = previous.sourceTimestamp;
         if (oldTime && newTime && newTime < oldTime) continue;
         const side = change.side === 'BUY' ? 'bids' : change.side === 'SELL' ? 'asks' : null;
         if (!side) throw new Error('Unsupported price-change side');
         const price = new Decimal(String(change.price)), size = new Decimal(String(change.size));
         if (!price.isFinite() || !size.isFinite() || price.lte(0) || price.gte(1) || size.lt(0)) throw new Error('Invalid stream delta');
-        const rows = snapshot[side].slice(), canonical = price.toString();
+        const snapshot = changed.get(id) ?? { ...previous };
+        const sideKey = `${id}:${side}`, rows = copiedSides.has(sideKey) ? snapshot[side] : snapshot[side].slice(), canonical = price.toString();
+        copiedSides.add(sideKey);
         const index = rows.findIndex(l => l.price === canonical);
         if (index >= 0) {
           if (size.isZero()) rows.splice(index, 1);
@@ -50,7 +55,9 @@ export class PolyStreamState {
           }
           rows.splice(left, 0, { price: canonical, shares: size.toString() });
         }
-        changed.set(id, { ...snapshot, [side]: rows, receivedAt: now, sourceTimestamp: newTime });
+        snapshot[side] = certifyLevels(rows, side === 'asks'); snapshot.receivedAt = now; snapshot.sourceTimestamp = newTime;
+        if (receivedMono !== undefined) snapshot.receivedMono = receivedMono;
+        changed.set(id, snapshot);
       }
       for (const [id, book] of changed) { this.snapshots.set(id, book); this.cache.set(book); }
       return;
@@ -67,6 +74,7 @@ export class PolyStreamState {
         ...raw, tick_size: raw.tick_size ?? tick?.size ?? asset.market.raw.orderPriceMinTickSize,
         min_order_size: raw.min_order_size ?? asset.market.raw.orderMinSize,
       }, asset.market, asset.outcome, 'websocket', now);
+      if (receivedMono !== undefined) book.receivedMono = receivedMono;
       this.snapshots.set(id, book); this.cache.set(book);
     } else if (type === 'tick_size_change') {
       const size = new Decimal(String(raw.new_tick_size));
@@ -84,17 +92,29 @@ export class PolyStreamState {
 
 export class LimitlessStreamState {
   private readonly versions = new Map<string, number>();
+  private readonly times = new Map<string, number>();
   private readonly markets: Map<string, Market>;
   constructor(markets: Market[], private readonly cache: BookCache) { this.markets = new Map(markets.map(m => [m.slug, m])); }
-  apply(value: unknown, now = Date.now()): void {
+  apply(value: unknown, now = Date.now(), receivedMono?: number): void {
     const raw = record(value), slug = String(raw.marketSlug), market = this.markets.get(slug);
     if (!market) return;
     const version = Number(raw.version);
     if (!Number.isSafeInteger(version) || version < 0) throw new Error('Missing or invalid Limitless version');
     const previous = this.versions.get(slug);
-    if (previous !== undefined && version <= previous) return;
+    if (previous !== undefined && version <= previous) {
+      const time = timestamp(raw.timestamp), oldTime = this.times.get(slug);
+      // A lower positive sequence with a newer event time can be a publisher
+      // restart. Invalidate/reconnect instead of accepting ambiguous ordering.
+      // Version zero is a documented database fallback, never a live reset.
+      if (version > 0 && version < previous && time !== null && oldTime !== undefined && time > oldTime) {
+        this.cache.clearMarkets('limitless', [slug]); throw new Error('Limitless publisher version restarted; resync required');
+      }
+      return;
+    }
     const books = limitlessBooks(raw.orderbook, market, 'websocket', now, raw.timestamp);
     this.versions.set(slug, version);
+    const time = timestamp(raw.timestamp); if (time !== null) this.times.set(slug, time);
+    if (receivedMono !== undefined) books.forEach(book => { book.receivedMono = receivedMono; });
     books.forEach(book => this.cache.set(book));
   }
 }
@@ -103,15 +123,18 @@ function health(): StreamHealth { return { connected: false, frames: 0, parseErr
 
 export class PublicStreams {
   private readonly localHealth = { polymarket: health(), limitless: health() };
+  private readonly retired = { polymarket: health(), limitless: health() };
   private readonly children: PublicStreams[] = [];
-  private readonly startTimers: NodeJS.Timeout[] = [];
+  private readonly startTimers = new Set<NodeJS.Timeout>();
   get health(): { polymarket: StreamHealth; limitless: StreamHealth } {
-    if (!this.children.length) return this.localHealth;
+    if (this.leaf || !this.children.length) return { polymarket: { ...this.localHealth.polymarket, ...this.polyQueue?.stats }, limitless: { ...this.localHealth.limitless, ...this.lmQueue?.stats } };
     const sum = (venue: 'polymarket' | 'limitless'): StreamHealth => {
       const states = this.children.filter(c => (venue === 'polymarket' ? c.poly : c.limitless).length).map(c => c.health[venue]);
-      return { connected: states.length > 0 && states.every(s => s.connected), frames: states.reduce((n,s)=>n+s.frames,0),
-        parseErrors: states.reduce((n,s)=>n+s.parseErrors,0), reconnects: states.reduce((n,s)=>n+s.reconnects,0),
-        lastFrameAt: states.map(s=>s.lastFrameAt).filter((v): v is string=>v!==null).sort().at(-1)??null };
+      return { connected: states.length > 0 && states.every(s => s.connected), frames: this.retired[venue].frames + states.reduce((n,s)=>n+s.frames,0),
+        parseErrors: this.retired[venue].parseErrors + states.reduce((n,s)=>n+s.parseErrors,0), reconnects: this.retired[venue].reconnects + states.reduce((n,s)=>n+s.reconnects,0),
+        lastFrameAt: states.map(s=>s.lastFrameAt).filter((v): v is string=>v!==null).sort().at(-1)??null,
+        pending: states.reduce((n,s)=>n+(s.pending??0),0), maxPending: states.reduce((n,s)=>n+(s.maxPending??0),0),
+        oldestMs: Math.max(0,...states.map(s=>s.oldestMs??0)), processed: (this.retired[venue].processed ?? 0) + states.reduce((n,s)=>n+(s.processed??0),0) };
     };
     return { polymarket: sum('polymarket'), limitless: sum('limitless') };
   }
@@ -125,22 +148,52 @@ export class PublicStreams {
   private lmReconnectTimer: NodeJS.Timeout | undefined;
   private attempts = 0;
 
-  constructor(private readonly poly: Market[], private readonly limitless: Market[], private readonly cache: BookCache, private readonly logger: Logger, private readonly diagnostic?: (category: string, payload: unknown) => void) {}
+  constructor(private poly: Market[], private limitless: Market[], private readonly cache: BookCache, private readonly logger: Logger, private readonly diagnostic?: (category: string, payload: unknown) => void, private readonly leaf = false) {}
 
   start(): void {
+    if (this.stopped) return;
     // Bound initial snapshot frames and per-connection subscription size while
     // retaining every market. Staggering avoids a simultaneous snapshot burst.
-    if (this.poly.length > 100 || this.limitless.length > 100) {
-      const groups = Math.ceil(Math.max(this.poly.length, this.limitless.length) / 100);
-      for (let i=0;i<groups;i++) {
-        const child = new PublicStreams(this.poly.slice(i*100,(i+1)*100),this.limitless.slice(i*100,(i+1)*100),this.cache,this.logger,this.diagnostic);
-        this.children.push(child);
-        this.startTimers.push(setTimeout(()=>{if(!this.stopped)child.start();},i*1000));
-      }
-      return;
-    }
+    if (!this.leaf) { this.update(this.poly, this.limitless); return; }
     if (this.poly.length) this.connectPoly();
     if (this.limitless.length) this.connectLimitless();
+  }
+
+  update(poly: Market[], limitless: Market[]): void {
+    if (this.stopped || this.leaf) return;
+    const fingerprint = (m: Market) => `${m.slug}:${m.yesToken}:${m.noToken}:${m.rulesHash}`;
+    const next: PublicStreams[] = [];
+    let launches = 0;
+    for (const venue of ['polymarket', 'limitless'] as const) {
+      const markets = venue === 'polymarket' ? poly : limitless, remaining = new Map(markets.map(m => [m.slug, m]));
+      const existingSlugs = new Set(this.children.flatMap(c => (venue === 'polymarket' ? c.poly : c.limitless).map(m => m.slug)));
+      const additions = new Map([...remaining].filter(([slug]) => !existingSlugs.has(slug)));
+      const launch = (group: Market[]) => {
+        const child = new PublicStreams(venue === 'polymarket' ? group : [], venue === 'limitless' ? group : [], this.cache, this.logger, this.diagnostic, true);
+        next.push(child);
+        const wait = launches++ * 250;
+        const timer = setTimeout(() => { this.startTimers.delete(timer); if (!this.stopped) child.start(); }, wait);
+        this.startTimers.add(timer);
+      };
+      for (const child of this.children.filter(c => (venue === 'polymarket' ? c.poly : c.limitless).length)) {
+        const old = venue === 'polymarket' ? child.poly : child.limitless;
+        const group: Market[] = [];
+        for (const market of old) { const current = remaining.get(market.slug); if (current) { group.push(current); remaining.delete(market.slug); } }
+        for (const [slug, market] of additions) {
+          if (group.length >= 100) break;
+          group.push(market); additions.delete(slug); remaining.delete(slug);
+        }
+        if (group.length === old.length && group.every((m, i) => fingerprint(m) === fingerprint(old[i]!))) next.push(child);
+        else {
+          const previous = child.health[venue], retired = this.retired[venue];
+          retired.frames += previous.frames; retired.parseErrors += previous.parseErrors; retired.reconnects += previous.reconnects; retired.processed = (retired.processed ?? 0) + (previous.processed ?? 0);
+          child.stop(); this.cache.clearMarkets(venue, old.map(m => m.slug)); if (group.length) launch(group);
+        }
+      }
+      const added = [...remaining.values()];
+      for (let i = 0; i < added.length; i += 100) launch(added.slice(i, i + 100));
+    }
+    this.children.splice(0, this.children.length, ...next); this.poly = poly; this.limitless = limitless;
   }
 
   private connectPoly(): void {
@@ -149,17 +202,17 @@ export class PublicStreams {
     const socket = new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/market', { handshakeTimeout: 10000 });
     this.polySocket = socket;
     const rejected = (error: unknown) => {
-      queue.stop(); this.health.polymarket.parseErrors++;
+      queue.stop(); this.localHealth.polymarket.parseErrors++;
       this.cache.clearMarkets('polymarket', this.poly.map(m => m.slug)); socket.terminate();
       this.logger.warn({ err: String(error) }, 'Polymarket stream rejected; resync required');
     };
-    const queue = new StreamQueue((value, receivedAt) => {
-      if (!this.stopped && socket === this.polySocket && socket.readyState === WebSocket.OPEN) state.apply(value, receivedAt);
+    const queue = new StreamQueue((value, receivedAt, receivedMono) => {
+      if (!this.stopped && socket === this.polySocket && socket.readyState === WebSocket.OPEN) state.apply(value, receivedAt, receivedMono);
     }, rejected);
     this.polyQueue = queue;
     let lastMessage = Date.now();
     socket.on('open', () => {
-      this.health.polymarket.connected = true;
+      this.localHealth.polymarket.connected = true;
       this.attempts = 0;
       socket.send(JSON.stringify({ type: 'market', assets_ids: this.poly.flatMap(m => [m.yesToken, m.noToken]) }));
       this.diagnostic?.('raw-websocket-subscribe', { venue: 'polymarket', assets_ids: this.poly.flatMap(m => [m.yesToken, m.noToken]) });
@@ -169,20 +222,21 @@ export class PublicStreams {
       }, 10000);
     });
     socket.on('message', bytes => {
+      const receivedMono = profiler.start();
       lastMessage = Date.now();
       if (this.stopped) return;
       const body = bytes.toString();
       this.diagnostic?.('raw-websocket-polymarket', { receivedAt: Date.now(), body });
       if (body === 'PONG') return;
-      this.health.polymarket.frames++;
-      this.health.polymarket.lastFrameAt = new Date().toISOString();
+      this.localHealth.polymarket.frames++;
+      this.localHealth.polymarket.lastFrameAt = new Date().toISOString();
       try {
-        const parsed: unknown = JSON.parse(body);
+        const parsed: unknown = profiler.measure('json-decode', () => JSON.parse(body));
         const frames = (Array.isArray(parsed) ? parsed : [parsed]).filter(value => {
           const type = value && typeof value === 'object' ? (value as Record<string, unknown>).event_type : null;
           return ['book', 'price_change', 'tick_size_change'].includes(String(type));
         });
-        queue.push(frames, lastMessage);
+        queue.push(frames, lastMessage, receivedMono);
       }
       catch (e) { rejected(e); }
     });
@@ -190,11 +244,11 @@ export class PublicStreams {
     socket.on('close', () => {
       queue.stop();
       this.diagnostic?.('stream-disconnected', { venue: 'polymarket', stopped: this.stopped });
-      this.health.polymarket.connected = false;
+      this.localHealth.polymarket.connected = false;
       if (this.heartbeat) clearInterval(this.heartbeat);
       if (!this.stopped) this.cache.clearMarkets('polymarket', this.poly.map(m => m.slug));
       if (!this.stopped) {
-        this.health.polymarket.reconnects++;
+        this.localHealth.polymarket.reconnects++;
         this.reconnectTimer = setTimeout(() => this.connectPoly(), Math.min(30000, 1000 * 2 ** this.attempts++));
       }
     });
@@ -210,24 +264,24 @@ export class PublicStreams {
       if (this.stopped) return;
       state = new LimitlessStreamState(this.limitless, this.cache);
       queue?.stop();
-      queue = new StreamQueue((value, receivedAt) => { if (!this.stopped && socket.connected) state.apply(value, receivedAt); }, error => {
-        this.health.limitless.parseErrors++; this.cache.clearMarkets('limitless', this.limitless.map(m => m.slug));
+      queue = new StreamQueue((value, receivedAt, receivedMono) => { if (!this.stopped && socket.connected) state.apply(value, receivedAt, receivedMono); }, error => {
+        this.localHealth.limitless.parseErrors++; this.cache.clearMarkets('limitless', this.limitless.map(m => m.slug));
         this.logger.warn({ err: String(error) }, 'Limitless stream rejected; resync required');
         socket.disconnect(); if (!this.stopped) this.lmReconnectTimer = setTimeout(() => { if (!this.stopped) socket.connect(); }, 1000);
       });
       this.lmQueue = queue;
-      this.health.limitless.connected = true;
+      this.localHealth.limitless.connected = true;
       socket.emit('subscribe_market_prices', { marketSlugs: this.limitless.map(m => m.slug) });
       this.diagnostic?.('raw-websocket-subscribe', { venue: 'limitless', marketSlugs: this.limitless.map(m => m.slug) });
     });
     socket.on('orderbookUpdate', value => {
       if (this.stopped) return;
-      this.health.limitless.frames++;
-      this.health.limitless.lastFrameAt = new Date().toISOString();
+      this.localHealth.limitless.frames++;
+      this.localHealth.limitless.lastFrameAt = new Date().toISOString();
       queue?.push([value], Date.now());
     });
-    socket.on('disconnect', reason => { queue?.stop(); this.diagnostic?.('stream-disconnected', { venue: 'limitless', reason }); this.health.limitless.connected = false; if (!this.stopped) this.cache.clearMarkets('limitless', this.limitless.map(m => m.slug)); });
-    socket.io.on('reconnect_attempt', () => { this.health.limitless.reconnects++; });
+    socket.on('disconnect', reason => { queue?.stop(); this.diagnostic?.('stream-disconnected', { venue: 'limitless', reason }); this.localHealth.limitless.connected = false; if (!this.stopped) this.cache.clearMarkets('limitless', this.limitless.map(m => m.slug)); });
+    socket.io.on('reconnect_attempt', () => { this.localHealth.limitless.reconnects++; });
     socket.on('connect_error', e => this.logger.warn({ err: e.message }, 'Limitless WebSocket error'));
     for (const event of ['exception', 'error']) socket.on(event, value => this.logger.warn({ event, value }, 'Limitless subscription error'));
   }

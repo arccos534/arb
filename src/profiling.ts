@@ -1,11 +1,19 @@
-import { performance } from 'node:perf_hooks';
+import { performance, monitorEventLoopDelay } from 'node:perf_hooks';
 
-export const stages = ['receipt', 'decode', 'book-update', 'search', 'quote', 'fees', 'liquidity', 'risk', 'schedule', 'artificial-delay', 'recheck', 'execute', 'stream-queue', 'decision-queue', 'persistence', 'snapshot', 'http', 'snapshot-wait'] as const;
+export const stages = ['receipt', 'json-decode', 'decode', 'book-update', 'search', 'quote', 'fees', 'liquidity', 'risk', 'schedule', 'artificial-delay', 'recheck', 'execute', 'stream-queue', 'decision-queue', 'quote-to-decision', 'decision-complete', 'persistence', 'wal', 'checkpoint', 'ui', 'rate-limit', 'snapshot', 'http', 'snapshot-wait'] as const;
 export type Stage = typeof stages[number];
 type Bucket = { count: number; totalMs: number; maxMs: number; rejected: number; networkRequests: number; samples: number[] };
 /** Bounded recent samples; totals cover this process lifetime. Nested spans overlap. */
 export class Profiler {
   private readonly buckets = new Map<Stage, Bucket>();
+  private loop: ReturnType<typeof monitorEventLoopDelay> | undefined;
+  private loopStart = performance.eventLoopUtilization();
+  startRuntime(): void {
+    if (!this.enabled || this.loop) return;
+    this.loopStart = performance.eventLoopUtilization();
+    this.loop = monitorEventLoopDelay({ resolution: 10 }); this.loop.enable();
+  }
+  stopRuntime(): void { this.loop?.disable(); this.loop = undefined; }
   constructor(public enabled = false, private readonly capacity = 4096) {
     if (!Number.isInteger(capacity) || capacity < 1 || capacity > 4096) throw new Error('Invalid profile capacity');
   }
@@ -28,7 +36,9 @@ export class Profiler {
   }
   report() {
     return { schemaVersion: 1, enabled: this.enabled, updatedAt: new Date().toISOString(),
-      clock: 'monotonic', percentileWindow: this.capacity, scope: 'process; nested spans overlap; HTTP is RTT, not one-way delivery',
+      clock: 'monotonic', percentileWindow: this.capacity, scope: 'process; nested spans overlap; HTTP is RTT, not one-way delivery; decode is normalization, json-decode is explicit JSON.parse',
+      runtime: { memoryRssMb: process.memoryUsage.rss() / 1024 ** 2, eventLoopUtilization: performance.eventLoopUtilization(this.loopStart).utilization,
+        eventLoopDelay: this.loop ? { resolutionMs: 10, p50Ms: this.loop.percentile(50) / 1e6, p95Ms: this.loop.percentile(95) / 1e6, p99Ms: this.loop.percentile(99) / 1e6, maxMs: this.loop.max / 1e6 } : null },
       stages: stages.map(stage => {
         const b = this.buckets.get(stage), sorted = b?.samples.slice().sort((a, c) => a - c) ?? [];
         const percentile = (p: number) => sorted.length ? sorted[Math.ceil(sorted.length * p) - 1]! : null;

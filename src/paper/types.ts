@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { Book, FeeModel, Outcome, Pair, Venue } from '../domain.js';
+import type { BookCache } from '../books.js';
 
 const money = z.string().regex(/^(0|[1-9]\d*)(\.\d{1,6})?$/).refine(v => Number(v) <= 1000000);
 export const paperSettingsSchema = z.object({
@@ -76,6 +77,6 @@ export interface PaperState {
   haltReason: string | null;
   entryDiagnostics?: { blockedSignals: number; recent: { pairId: string; direction: PaperTrade['direction']; at: number; reasons: string[] }[] };
 }
-export interface FeedSnapshot { at: number; pairs: Pair[]; books: Book[]; ready: boolean }
+export interface FeedSnapshot { at: number; pairs: Pair[]; books: Book[]; ready: boolean; bookCache?: BookCache; bookCount?: number }
 export interface Resolution { venue: Venue; slug: string; yesPayout: string; noPayout: string; evidence: unknown; at: number }
 export type DemoScenario = 'normal' | 'partial' | 'rejection' | 'delayed' | 'mismatch';

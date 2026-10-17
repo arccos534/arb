@@ -18,6 +18,7 @@ import { PaperRepository } from './paper/repository.js';
 import { DemoFeed } from './paper/demo.js';
 import { strategyProfile } from './paper/profiles.js';
 import { fetchResolution } from './paper/resolution.js';
+import { MarketDatabase, type MarketCandidate, type MarketQuery, type MarketResult } from './market-database.js';
 import { paperSettingsSchema, type DemoScenario, type FeedSnapshot, type PaperState, type Source } from './paper/types.js';
 
 export class Application {
@@ -27,6 +28,7 @@ export class Application {
   readonly demo = new DemoFeed();
   readonly reviewsPath: string;
   readonly dataDir: string;
+  readonly marketDatabase: MarketDatabase;
   observer: ResearchRunner | undefined;
   observerError: string | null = null;
   private observerTask: Promise<void> | undefined;
@@ -37,6 +39,7 @@ export class Application {
   private checkpointAt = 0;
   private resolutionAt = 0;
   private resolving = false;
+  private resolutionTask: Promise<void> | undefined;
   private readonly executionRefreshes = new Map<string, Promise<void>>();
   private lastTickAt = 0;
   private readonly runtime = { lastEngineMs: 0, maxEngineMs: 0, lastTickLagMs: 0, maxTickLagMs: 0 };
@@ -44,13 +47,14 @@ export class Application {
 
   constructor(readonly config: Config) {
     this.dataDir = path.resolve(config.DATA_DIR);
+    this.marketDatabase = new MarketDatabase(this.dataDir,pair => this.marketCandidate(pair));
     this.reviewsPath = path.join(this.dataDir, 'paper-reviews.json');
     this.audit = new AuditJournal(path.join(this.dataDir, 'audit'), Number(process.env.AUDIT_MAX_MB ?? 2048) * 1024 ** 2, error => {
       for (const engine of Object.values(this.engines)) { engine.state.running = false; engine.state.haltReason = error; }
       this.observer?.stop(); this.observerError = error;
     });
     this.repositories = { live: new PaperRepository(path.join(this.dataDir, 'paper-live'), 'live'), demo: new PaperRepository(path.join(this.dataDir, 'paper-demo'), 'demo') };
-    this.http = new PublicHttp(config.REQUEST_TIMEOUT_MS, (category, payload) => this.audit.record(category, 'live', payload));
+    this.http = new PublicHttp(config.REQUEST_TIMEOUT_MS, (category, payload) => this.audit.record(category, 'live', payload), config.MIN_HTTP_INTERVAL_MS);
   }
   async open(startObserver = true): Promise<void> {
     await mkdir(this.dataDir, { recursive: true });
@@ -67,11 +71,12 @@ export class Application {
       await this.persist(source);
     }
     const demoTrade = this.engines.demo.state.trades.at(-1);
+    await this.marketDatabase.open();
     if (demoTrade) this.demo.restore(demoTrade.pair, demoTrade.signalAt, (demoTrade.notes.find(n => n.startsWith('scenario:'))?.slice(9) ?? 'normal') as DemoScenario);
     let dependencyHash: string | null = null;
     try { dependencyHash = createHash('sha256').update(await readFile('package-lock.json')).digest('hex'); } catch { /* optional deployment manifest */ }
     this.audit.record('application-started', 'system', { version: '0.2.0', node: process.version, platform: platform(), cpuThreads: cpus().length, dependencyHash, pid: process.pid, config: { ...this.config, DATABASE_URL: this.config.DATABASE_URL ? '[CONFIGURED]' : '' } });
-    this.scheduler = new DecisionScheduler(ids => this.tick(ids), error => this.fail(error));
+    this.scheduler = new DecisionScheduler((ids, mono) => this.tick(ids, mono), error => this.fail(error));
     if (startObserver) this.startObserver();
     this.timer = setInterval(() => {
       const arrivedAt = Date.now();
@@ -79,19 +84,20 @@ export class Application {
       this.runtime.maxTickLagMs = Math.max(this.runtime.maxTickLagMs, this.runtime.lastTickLagMs); this.lastTickAt = arrivedAt;
       if (this.stopped) return;
       this.scheduler?.request();
-      if (!this.resolving && Date.now() - this.resolutionAt > 15000) void this.pollResolutions();
+      if (!this.resolving && Date.now() - this.resolutionAt > 15000) this.resolutionTask = this.pollResolutions();
     }, 250);
   }
-  private tick(changedPairIds?: ReadonlySet<string>): Promise<void> {
+  private tick(changedPairIds?: ReadonlySet<string>, receiptMono?: number): Promise<void> {
     return this.enqueue(async () => {
       if (this.stopped) return;
         for (const source of ['live', 'demo'] as const) {
           if (this.audit.error || (source === 'demo' && changedPairIds !== undefined)) continue;
           const engine = this.engines[source];
           if (!engine.state.running && !engine.state.trades.some(t => ['SCHEDULED', 'OPEN', 'UNHEDGED', 'WAITING_RESOLUTION'].includes(t.status)) && !engine.state.transfers.some(t => t.status !== 'COMPLETED')) continue;
-          const feed = this.feed(source);
+          const feed = source === 'live' && this.observer ? this.observer.decisionSnapshot(changedPairIds) : this.feed(source);
           const began = performance.now();
           engine.step(feed, source === 'live' ? changedPairIds : undefined);
+          if (source === 'live' && receiptMono !== undefined) profiler.end('quote-to-decision', receiptMono);
           this.runtime.lastEngineMs = performance.now() - began;
           this.runtime.maxEngineMs = Math.max(this.runtime.maxEngineMs, this.runtime.lastEngineMs);
           if (source === 'demo') {
@@ -127,8 +133,9 @@ export class Application {
       this.executionRefreshes.set(trade.id, task);
     }
   }
-  private onBookUpdate(ids: ReadonlySet<string>): void {
+  private onBookUpdate(ids: ReadonlySet<string>, receiptMono?: number): void {
     if (this.stopped || this.audit.error) return;
+    this.marketDatabase.mark(ids);
     const engine = this.engines.live, now = Date.now();
     const active = new Set(engine.state.trades.filter(t => ['SCHEDULED', 'UNHEDGED'].includes(t.status)).map(t => t.pairId));
     const relevant = [...ids].filter(id => {
@@ -136,12 +143,12 @@ export class Application {
       const pair = this.observer?.pair(id);
       return engine.state.running && pair && !engine.entryBlockers(pair, now).length && (pair.review.approved || engine.settings.skipManualReview);
     });
-    if (relevant.length) this.scheduler?.request(relevant);
+    if (relevant.length) this.scheduler?.request(relevant, receiptMono);
   }
   private startObserver(): void {
     const logger = pino({ level: this.config.LOG_LEVEL });
     this.observer = new ResearchRunner(this.config, logger, (category, payload) => this.audit.record(category, 'live', payload), this.reviewsPath,
-      () => this.engines.live.state.trades.filter(t => ['SCHEDULED', 'OPEN', 'UNHEDGED', 'WAITING_RESOLUTION'].includes(t.status)).map(t => t.pair), true, ids => this.onBookUpdate(ids));
+      () => this.engines.live.state.trades.filter(t => ['SCHEDULED', 'OPEN', 'UNHEDGED', 'WAITING_RESOLUTION'].includes(t.status)).map(t => t.pair), true, (ids, mono) => this.onBookUpdate(ids, mono),{catalog:(pairs,complete)=>this.marketDatabase.catalog(pairs,complete)});
     this.observerTask = this.observer.run({ once: false }).catch(e => { if (!this.stopped) {
       this.observerError = String(e); this.engines.live.state.running = false;
       this.audit.record('observer-error', 'live', { error: String(e) });
@@ -153,7 +160,9 @@ export class Application {
     return result;
   }
   private fail(error: unknown): void {
+    if (this.observerError === String(error)) return;
     this.observerError = String(error);
+    this.scheduler?.stop(); if (this.timer) clearInterval(this.timer); this.observer?.stop();
     for (const engine of Object.values(this.engines)) { engine.state.running = false; engine.state.haltReason = String(error); }
     this.audit.record('application-error', 'system', { error: String(error), stack: error instanceof Error ? error.stack : null });
   }
@@ -208,6 +217,7 @@ export class Application {
           engine.event('demo-started', 'Запущен отдельный синтетический сценарий', { scenario });
         } else throw new Error('Unsupported action');
         if (engine.dirty) await this.persist(source);
+        if(source==='live')this.marketDatabase.invalidate();
         return result;
       } catch (e) {
         engine.state = before;
@@ -231,31 +241,41 @@ export class Application {
       const next = [...reviews.filter(a => a.polymarketSlug !== pair.polymarket.slug || a.limitlessSlug !== pair.limitless.slug), approval];
       await writeFile(`${this.reviewsPath}.tmp`, JSON.stringify(next, null, 2)); await rename(`${this.reviewsPath}.tmp`, this.reviewsPath);
       this.audit.record('pair-reviewed', 'live', { pairId, approval });
+      pair.review={approved:true,reasons:[],validUntil:approval.validUntil};this.marketDatabase.mark([pairId]);
       this.observer?.requestDiscovery();
     });
   }
   async rescan(): Promise<void> { this.observer?.requestDiscovery(); this.audit.record('rescan-requested', 'live', {}); }
-  async view(source: Source): Promise<unknown> {
-    const engine = this.engines[source], feed = this.feed(source, false), cache = new BookCache(); feed.books.forEach(b => cache.set(b));
+  private marketCandidate(pair:Pair,source:Source='live'):MarketCandidate {
+    const engine=this.engines[source],feed=source==='live'&&this.observer?this.observer.decisionSnapshot():this.feed(source,false);
+    const cache=feed.bookCache??new BookCache();if(!feed.bookCache)feed.books.forEach(book=>cache.set(book));
+    const now=Date.now(),evaluations=engine.evaluate(pair,cache,now);
+    const invalid=new Set(['stale-or-future-book','stale-or-future-source-timestamp','book-time-skew','source-time-skew','missing-book','crossed-book','book-asset-mismatch']);
+    const fresh=(e:typeof evaluations[number])=>e.roi!==null&&!e.reasons.some(reason=>invalid.has(reason));
+    const priced=evaluations.filter(e=>e.profit!==null),current=priced.filter(fresh);
+    const best=(current.length?current:priced).sort((a,b)=>Number(b.roi)-Number(a.roi))[0];
+    const entryReasons=[...(best?.reasons??['missing-book']),...engine.entryBlockers(pair,now)];
+    if(best?.status==='research-positive')entryReasons.push(...engine.entryAssessment(pair,best.direction,cache,now).reasons);
+    if(best?.profit!==null&&best?.profit!==undefined&&Number(best.profit)<Number(engine.settings.minProfitUsd))entryReasons.push('expected-profit-below-minimum');
+    if(!engine.state.running)entryReasons.push('simulation-paused');
+    if(engine.state.trades.filter(t=>['SCHEDULED','OPEN','UNHEDGED','WAITING_RESOLUTION'].includes(t.status)).length>=engine.settings.maxPositions)entryReasons.push('open-position-limit');
+    const polySide=best?.direction==='poly-yes-limitless-no'?'yes':'no',lmSide=polySide==='yes'?'no':'yes';
+    const books=[cache.get('polymarket',pair.polymarket.slug,polySide),cache.get('limitless',pair.limitless.slug,lmSide)];
+    const freshUntil=best&&fresh(best)?Math.min(Date.parse(pair.polymarket.endsAt),Date.parse(pair.limitless.endsAt),...books.flatMap(book=>book?[book.receivedAt+engine.settings.maxQuoteAgeMs,...(book.sourceTimestamp===null?[]:[book.sourceTimestamp+engine.settings.maxQuoteAgeMs])]:[0])):0;
+    return {id:pair.id,title:pair.polymarket.title,limitlessTitle:pair.limitless.title,endsAt:pair.polymarket.endsAt,score:pair.score,review:pair.review,watched:source==='demo'||Boolean(this.observer?.pair(pair.id)),
+      entryReasons:[...new Set(entryReasons)],quoteReason:best?null:'missing-book',profit:best?.profit??null,roi:best?.roi??null,direction:best?.direction??null,reasons:best?.reasons??['missing-book'],
+      evaluations:evaluations.map(({legs:_legs,assumptions:_assumptions,...summary})=>summary),updatedAt:now,freshUntil,
+      strategyEligible:!engine.entryBlockers(pair,now).some(r=>['holding-period-too-long','entry-too-near-expiry'].includes(r)),
+      entryReady:best?.status==='research-positive'&&entryReasons.every(r=>r==='simulation-paused')};
+  }
+  markets(query:MarketQuery={}):Promise<MarketResult>{return this.marketDatabase.query(query);}
+  async view(source: Source,query:MarketQuery={}): Promise<unknown> {
+    const engine = this.engines[source], feed = source === 'live' && this.observer ? this.observer.decisionSnapshot() : this.feed(source, false);
+    const cache = feed.bookCache ?? new BookCache(); if (!feed.bookCache) feed.books.forEach(b => cache.set(b));
     const pairs = source === 'demo' ? feed.pairs : this.observer?.allPairs() ?? [];
-    const watchedIds = new Set(feed.pairs.map(p => p.id));
-    const openCount = engine.state.trades.filter(t => ['SCHEDULED', 'OPEN', 'UNHEDGED', 'WAITING_RESOLUTION'].includes(t.status)).length;
-    const candidates = pairs.map(pair => {
-      const evaluation = engine.evaluate(pair, cache, feed.at);
-      const best = [...evaluation].filter(e => e.profit !== null).sort((a, b) => Number(b.profit) - Number(a.profit))[0];
-      const watched = watchedIds.has(pair.id);
-      const entryReasons = [...(best?.reasons ?? [])];
-      if (best?.status === 'research-positive') entryReasons.push(...engine.entryAssessment(pair, best.direction, cache, feed.at).reasons);
-      if (best?.profit !== null && best?.profit !== undefined && Number(best.profit) < Number(engine.settings.minProfitUsd)) entryReasons.push('expected-profit-below-minimum');
-      if (!engine.state.running) entryReasons.push('simulation-paused');
-      entryReasons.push(...engine.entryBlockers(pair, feed.at));
-      if (openCount >= engine.settings.maxPositions) entryReasons.push('open-position-limit');
-      const quoteReasons = evaluation.flatMap(e => e.reasons).filter(r => !['manual-rules-review-required', 'rules-changed-since-review', 'review-expired', 'invalid-review-dates'].includes(r));
-      return { id: pair.id, title: pair.polymarket.title, limitlessTitle: pair.limitless.title, endsAt: pair.polymarket.endsAt, score: pair.score, review: pair.review, watched,
-        entryReasons, quoteReason: best ? null : !watched ? 'outside-watch-limit' : quoteReasons.find(r => r !== 'missing-book') ?? 'missing-book',
-        profit: best?.profit ?? null, roi: best?.roi ?? null, direction: best?.direction ?? null, reasons: best?.reasons ?? ['missing-book'],
-        evaluations: evaluation.map(({ legs: _legs, assumptions: _assumptions, ...summary }) => summary) };
-    }).sort((a, b) => a.roi === null ? b.roi === null ? a.id.localeCompare(b.id) : 1 : b.roi === null ? -1 : Number(b.roi) - Number(a.roi));
+    const marketResult=source==='live'?await this.markets(query):null;
+    const candidates=marketResult?.candidates??pairs.slice(0,10).map(pair=>this.marketCandidate(pair,'demo'));
+    feed.at = Date.now();
     let health: unknown = null;
     try { health = JSON.parse(await readFile(path.join(this.dataDir, 'health-latest.json'), 'utf8')); } catch { /* starting */ }
     const liveHealth = source === 'live' ? this.observer?.liveHealth() : undefined;
@@ -263,14 +283,14 @@ export class Application {
     const state = engine.state;
     return {
       at: Date.now(), source, paperOnly: true, runtime: { ...this.runtime, decisions: this.scheduler?.stats }, state: { ...state, trades: state.trades.map(({ pair, ...trade }) => ({ ...trade, identityWarning: identityBlockers(pair).includes('conflicting-market-identity') })), ledger: state.ledger.slice(-100), events: state.events.slice(-100) },
-      metrics: engine.metrics(feed), strategyProfiles: { '200': strategyProfile(200), '500': strategyProfile(500) }, candidates, feed: { ready: feed.ready, books: feed.books.length,
+      metrics: engine.metrics(feed), strategyProfiles: { '200': strategyProfile(200), '500': strategyProfile(500) }, candidates, marketDatabase:marketResult?.database??null, feed: { ready: feed.ready, books: feed.bookCount ?? feed.books.length,
         observerError: source === 'live' ? this.observerError : null,
         discoveryError: source === 'live' ? this.observer?.lastDiscoveryError ?? liveHealth?.linkedRefreshError ?? null : null,
         discoveryRetrying: liveHealth?.catalogRetrying ?? false, health,
-        coverage: { total: pairs.length, subscribed: feed.pairs.length, calculated: candidates.filter(p => p.roi !== null).length,
-          freshCalculated: candidates.filter(p => p.evaluations.some(e => e.roi !== null && !e.reasons.some(r => ['stale-or-future-book', 'stale-or-future-source-timestamp', 'book-time-skew', 'crossed-book'].includes(r)))).length,
+        coverage: { total: pairs.length, subscribed: feed.pairs.length, calculated: marketResult?.database.calculated??candidates.filter(p => p.roi !== null).length,
+          freshCalculated: marketResult?.database.freshCalculated??candidates.filter(p=>p.freshUntil>Date.now()).length,
           watchLimit: this.config.MAX_WATCH_PAIRS },
-        catalog: source === 'live' && this.observer ? { ...this.observer.catalogProgress, coverage: this.observer.catalogCoverage,
+        catalog: source === 'live' && this.observer ? { ...this.observer.catalogProgress, coverage: this.observer.catalogCoverage?{...this.observer.catalogCoverage,unmatched:[],unmatchedCount:(this.observer.catalogCoverage.unmatched as unknown[]|undefined)?.length??0}:null,
           horizonHours: this.config.HORIZON_HOURS, minHoursToEnd: this.config.MIN_HOURS_TO_END, maxPages: this.config.MAX_PAGES } : null }, audit: this.audit.status(),
       balances: { polymarket: { cash: state.cash.polymarket, available: engine.available('polymarket').toString() }, limitless: { cash: state.cash.limitless, available: engine.available('limitless').toString() }, bybit: { cash: state.cash.bybit, available: state.cash.bybit } },
       additionalSources: source === 'live' ? this.observer?.additionalSources.sources ?? [] : [],
@@ -300,11 +320,14 @@ export class Application {
     this.scheduler?.stop(); await this.scheduler?.drain();
     this.observer?.stop();
     await this.observerTask;
+    await this.marketDatabase.close();
     await Promise.all(this.executionRefreshes.values());
+    await this.resolutionTask;
     await this.chain;
     for (const source of ['live', 'demo'] as const) {
       this.engines[source].setRunning(false);
       await this.persist(source);
+      await this.repositories[source].checkpoint(this.engines[source].state);
     }
     this.audit.record('application-stopped', 'system', {}); await this.audit.flush();
   }

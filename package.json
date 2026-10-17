@@ -11,6 +11,8 @@
     "scan": "tsx src/cli.ts scan",
     "observe": "tsx src/cli.ts observe",
     "benchmark": "tsx src/cli.ts benchmark",
+    "benchmark:performance": "node scripts/benchmark-performance.mjs",
+    "verify:local": "node scripts/verify-local.mjs",
     "diagnose:execution": "tsx src/diagnostics/collector.ts",
     "report": "tsx src/cli.ts report",
     "build": "tsc -p tsconfig.json",

@@ -23,6 +23,13 @@ try{
   };
   await page.route('**/api/state?source=live',networkStatusRoute);
   await page.goto(`http://127.0.0.1:${port}`);
+  assert.equal(await page.locator('html').getAttribute('data-theme'),'dark');
+  await page.locator('[data-theme-toggle]').click();
+  assert.equal(await page.locator('html').getAttribute('data-theme'),'light');
+  await page.reload();
+  assert.equal(await page.locator('html').getAttribute('data-theme'),'light');
+  await page.locator('[data-theme-toggle]').click();
+  assert.equal(await page.locator('html').getAttribute('data-theme'),'dark');
   await page.locator('[role="status"]').filter({hasText:'fetch failed'}).waitFor();
   assert.ok((await page.locator('[role="status"]').filter({hasText:'fetch failed'}).textContent()).includes('Повторная загрузка уже идёт'));
   assert.equal(await page.locator('.banner-error').count(),0);
@@ -30,6 +37,7 @@ try{
   await page.locator('[role="status"]').filter({hasText:'fetch failed'}).waitFor({state:'detached'});
   await page.unroute('**/api/state?source=live',networkStatusRoute);
   await page.getByRole('heading',{name:'Контрольная панель'}).waitFor();
+  assert.ok(await page.locator('[data-market-row]').count()<=10);
   await page.getByLabel('Источник данных').selectOption('demo');
   await page.getByTestId('run-demo').waitFor();
   await page.getByTestId('run-demo').click();

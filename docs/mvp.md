@@ -97,7 +97,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\stop-local.ps1
 | `audit/audit-YYYY-MM-DD-NNNN.jsonl.gz` | Торговые события, исполнения со стаканом, комиссии, расчёты, настройки и критические ошибки. Ротация сжатых файлов примерно по 16 МБ. Потоки REST/WS и снимки капитала не архивируются |
 | `paper-live/state.json` | Текущее состояние виртуального счёта реальных котировок |
 | `paper-demo/state.json` | Отдельное состояние синтетического счёта |
-| `paper-*/transactions.jsonl` | Write-ahead журнал экономических изменений с последовательностью, событиями и полным следующим состоянием |
+| `paper-*/transactions.jsonl` | Надёжный WAL: полное опорное состояние и компактные обновления schemaVersion=2; старые полные записи читаются. Checkpoint периодический и при остановке |
 | `paper-*/sessions/UUID.json` | Архивы завершённых сессий после сброса |
 | `paper-reviews.json` | Пользовательские проверки контрактов для paper trading |
 | `observer.stdout.log`, `observer.stderr.log` | Вывод локального процесса |

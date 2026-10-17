@@ -6,6 +6,23 @@ import { startServer } from '../src/server.js';
 import { loadConfig } from '../src/config.js';
 
 describe('local paper-only HTTP application',()=>{
+  it('streams index updates without exposing the full catalogue or a command token and closes active streams gracefully',async()=>{
+    const dir=await mkdtemp(path.join(tmpdir(),'mvp-stream-'));
+    const instance=await startServer({config:loadConfig({DATA_DIR:dir,LOG_LEVEL:'silent'}),port:0,startObserver:false,lock:false});
+    const controller=new AbortController();
+    try{
+      const response=await fetch(instance.url+'/api/markets/stream',{signal:controller.signal});
+      expect(response.headers.get('content-type')).toContain('text/event-stream');
+      const reader=response.body!.getReader(),decoder=new TextDecoder();let pending='';
+      const next=async()=>{while(!pending.includes('\n\n')){const chunk=await reader.read();if(chunk.done)throw new Error('Stream ended');pending+=decoder.decode(chunk.value,{stream:true});}
+        const boundary=pending.indexOf('\n\n'),event=pending.slice(0,boundary);pending=pending.slice(boundary+2);return JSON.parse(event.slice('data: '.length));};
+      const first=await next();expect(first.candidates).toEqual([]);expect(first.csrf).toBeUndefined();
+      const {pair}=await import('./fixtures.js');instance.app.marketDatabase.catalog([pair()]);await instance.app.marketDatabase.settle();
+      let update=await next();for(let i=0;i<4&&update.database.total!==1;i++)update=await next();
+      expect(update.database.total).toBe(1);expect(update.candidates.length).toBeLessThanOrEqual(10);
+      await instance.close();await reader.cancel();
+    }finally{controller.abort();await instance.close();await rm(dir,{recursive:true,force:true});}
+  },10000);
   it('serves UI, validates local commands, rejects cross-origin writes and never accepts credentials',async()=>{
     const dir=await mkdtemp(path.join(tmpdir(),'mvp-http-'));
     const instance=await startServer({config:loadConfig({DATA_DIR:dir,LOG_LEVEL:'silent'}),port:0,startObserver:false,lock:false});

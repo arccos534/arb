@@ -14,7 +14,6 @@ import { ResearchStorage } from './storage.js';
 import { PublicStreams } from './streams.js';
 import type { FeedSnapshot } from './paper/types.js';
 import { AdditionalSources } from './additional-sources.js';
-import { setTimeout as delay } from 'node:timers/promises';
 
 export class ResearchRunner {
   private readonly bookRequests = new Map<string, Promise<void>>();
@@ -54,13 +53,13 @@ export class ResearchRunner {
   private readonly savedMarketRules = new Set<string>();
   private readonly startedAt = new Date().toISOString();
 
-  constructor(private readonly config: Config, private readonly logger: Logger, private readonly diagnostic?: (category: string, payload: unknown) => void, private readonly reviewsPath = 'config/pairs.json', private readonly pinnedPairs: () => Pair[] = () => [], private readonly tradesOnlyLogging = false, onBookUpdate?: (pairs: ReadonlySet<string>) => void, hooks?: { book: (book: Book) => void; invalidate: (key: string) => void }) {
+  constructor(private readonly config: Config, private readonly logger: Logger, private readonly diagnostic?: (category: string, payload: unknown) => void, private readonly reviewsPath = 'config/pairs.json', private readonly pinnedPairs: () => Pair[] = () => [], private readonly tradesOnlyLogging = false, onBookUpdate?: (pairs: ReadonlySet<string>, receivedMono?: number) => void, private readonly hooks?: { book?: (book: Book) => void; invalidate?: (key: string) => void; catalog?: (pairs:Pair[],complete:boolean)=>void }) {
     this.cache = new BookCache(book => {
-      hooks?.book(book);
+      hooks?.book?.(book);
       const pairs = this.marketPairs.get(`${book.venue}:${book.slug}`);
-      if (pairs?.size) onBookUpdate?.(pairs);
-    }, key => hooks?.invalidate(key));
-    this.http = new PublicHttp(config.REQUEST_TIMEOUT_MS, diagnostic);
+      if (pairs?.size) onBookUpdate?.(pairs, book.receivedMono);
+    }, key => { hooks?.invalidate?.(key); const ids=this.marketPairs.get(key.slice(0,key.lastIndexOf(':'))); if(ids?.size)onBookUpdate?.(ids); });
+    this.http = new PublicHttp(config.REQUEST_TIMEOUT_MS, diagnostic, config.MIN_HTTP_INTERVAL_MS);
     this.additionalSources = new AdditionalSources(this.http, diagnostic);
     this.adapters = new PublicAdapters(this.http, config, (venue, progress) => { this.catalogProgress[venue] = progress; }, () => this.stopped);
     this.store = new ResearchStorage(config, !tradesOnlyLogging);
@@ -84,6 +83,15 @@ export class ResearchRunner {
     } finally { profiler.end('snapshot', profileStart); }
   }
   allPairs(): Pair[] { return this.pairs; }
+  decisionSnapshot(changedPairIds?: ReadonlySet<string>): FeedSnapshot {
+    let pairs = this.watch;
+    if (changedPairIds) {
+      const ids = new Set(changedPairIds);
+      for (const pair of this.pinnedPairs()) ids.add(pair.id);
+      pairs = [...ids].map(id => this.pairIndex.get(id)).filter((pair): pair is Pair => pair !== undefined);
+    }
+    return { at: Date.now(), pairs, books: [], ready: this.discoveryReady, bookCache: this.cache, bookCount: this.cache.size };
+  }
   pair(id: string): Pair | undefined { return this.pairIndex.get(id); }
   liveHealth() { return { ready: this.discoveryReady, phase: this.catalogProgress.phase, cycles: this.cycles,
     catalogRetrying: Boolean(this.discoveryTask || this.linkedRefreshTask), catalogError: this.lastDiscoveryError,
@@ -331,7 +339,6 @@ export class ResearchRunner {
     });
     const signature = (items: Pair[]) => [...new Set(items.flatMap(p => [p.polymarket, p.limitless]).map(m => `${m.venue}:${m.slug}:${m.yesToken}:${m.noToken}:${m.rulesHash}`))].sort().join('|');
     const changed = signature(watched) !== signature(this.watch);
-    if (changed) this.streams?.stop();
     this.cache.retainMarkets(watched.flatMap(p => [p.polymarket, p.limitless]));
     this.pairs = pairs; this.watch = watched;
     this.pairIndex.clear(); this.marketPairs.clear();
@@ -343,12 +350,15 @@ export class ResearchRunner {
       }
     }
     this.discoveryReady = true;
+    this.hooks?.catalog?.(this.pairs,this.catalogProgress.complete);
     this.nextRest = 0;
     if (this.config.USE_WEBSOCKETS && !this.stopped && watched.length && (changed || !this.streams)) {
       const unique = (markets: Market[]) => [...new Map(markets.map(m => [m.slug, m])).values()];
-      this.streams = new PublicStreams(unique(watched.map(p => p.polymarket)), unique(watched.map(p => p.limitless)), this.cache, this.logger, this.diagnostic);
-      this.streams.start();
+      const polyMarkets = unique(watched.map(p => p.polymarket)), lmMarkets = unique(watched.map(p => p.limitless));
+      if (this.streams) this.streams.update(polyMarkets, lmMarkets);
+      else { this.streams = new PublicStreams(polyMarkets, lmMarkets, this.cache, this.logger, this.diagnostic); this.streams.start(); }
     }
+    if (!watched.length && this.streams) { this.streams.stop(); this.streams = undefined; }
     this.logger.info({ polyMarkets: filled.markets.length, limitlessMarkets: lm.markets.length, candidates: pairs.length, watched: watched.length, truncated: poly.truncated || lm.truncated }, 'Market discovery saved');
   }
 
@@ -365,7 +375,6 @@ export class ResearchRunner {
     }
     const errors = await mapLimit(markets, 2, async market => {
       if (this.stopped) return null;
-      if (!selected) await delay(750);
       if (this.stopped) return null;
       const before = ['yes', 'no'].map(side => this.cache.get(market.venue, market.slug, side));
       const invalidate = (side: 'yes' | 'no', index: number) => {
@@ -375,13 +384,13 @@ export class ResearchRunner {
       try {
         if (market.venue === 'polymarket') {
           const results = await Promise.allSettled(sides.map(side => this.bookRequest(`${market.venue}:${market.slug}:${side}`, async () => {
-            try { this.cache.set(await this.adapters.polyBook(market, side)); }
+            try { this.cache.set(await this.adapters.polyBook(market, side, selected !== undefined)); }
             catch (error) { invalidate(side, side === 'yes' ? 0 : 1); throw error; }
           })));
           const failures = results.filter(r => r.status === 'rejected');
           if (failures.length) throw new Error(failures.map(r => String(r.reason)).join('; '));
         } else await this.bookRequest(`${market.venue}:${market.slug}`, async () => {
-          try { (await this.adapters.limitlessBooks(market)).forEach(b => this.cache.set(b)); }
+          try { (await this.adapters.limitlessBooks(market, selected !== undefined)).forEach(b => this.cache.set(b)); }
           catch (error) { invalidate('yes', 0); invalidate('no', 1); throw error; }
         });
         return null;

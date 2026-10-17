@@ -34,6 +34,7 @@ export interface Book {
   asks: Level[];
   bids: Level[];
   receivedAt: number;
+  receivedMono?: number;
   sourceTimestamp: number | null;
   transport: 'rest' | 'websocket';
   tickSize: string | null;

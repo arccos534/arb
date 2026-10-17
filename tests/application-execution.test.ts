@@ -28,7 +28,7 @@ describe('application quote to paper execution path', () => {
     const pair = latest.pairs[0]!;
     const runner = new ResearchRunner(config, pino({ level: 'silent' }));
     vi.spyOn(runner, 'pair').mockReturnValue(pair);
-    vi.spyOn(runner, 'snapshot').mockImplementation(() => ({ ...latest, at: Date.now() }));
+    vi.spyOn(runner, 'decisionSnapshot').mockImplementation(() => ({ ...latest, at: Date.now() }));
     const rest = vi.spyOn(runner, 'refreshExecutionBooks').mockReturnValue(restPending);
     try {
       await app.open(false); app.observer = runner;

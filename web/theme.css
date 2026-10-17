@@ -1,0 +1,33 @@
+.theme-toggle{white-space:nowrap;font-size:11px;min-height:32px}
+.live-db{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:20px;padding:15px 18px;border:1px solid var(--line);border-radius:8px;background:var(--mint);font-size:12px;line-height:1.7}
+.live-db strong{color:var(--green)}.live-db .db-details{flex-basis:100%;font-size:11px}.live-db time{font-variant-numeric:tabular-nums}.top-ten .market-title{max-width:420px}.quote-age{font-size:10px;margin-top:6px;color:var(--muted)}
+.top-ten .table-controls,.top-ten .tabs{flex-wrap:wrap}.top-ten .table-controls{align-items:flex-start}
+html[data-theme="dark"]{color-scheme:dark;background:#101715;color:#e4ece6;--green:#8cdab0;--mint:#1b2b24;--line:#30433a;--muted:#acbbb2;--orange:#e8ba83;--red:#ff9791}
+html[data-theme="dark"] body{background:#101715;color:#dce7df}
+html[data-theme="dark"] :is(.sidebar,.topbar,.panel,.stat-card,.connection-card,.scenario-card,dialog,.modal-head){background:#18221d;border-color:#30433a;color:#e4ece6}
+html[data-theme="dark"] :is(h1,h2,h3,.brand,.breadcrumb strong,.stat-value,.chart-value,.account-name,.account-amount,.market-title,.detail-item,.empty strong){color:#e4ece6}
+html[data-theme="dark"] :is(p,small,.subtitle,.stat-label,.stat-bottom,.market-sub,.field,.field small,.mini-note,.chart-footer,.account-note,.table-bottom,.log-message,.log-row time,.connection-card p,.rule-box p,.rule-box small,.check,.sidebar-bottom p,.sidebar-bottom strong,.nav-label,footer){color:#a8bab0}
+html[data-theme="dark"] :is(.workspace,.workspace-avatar,.avatar,.icon-button,.detail-item,.json-view,.account-note,.tag.neutral,.paper-badge){background:#223129;color:#bfcec3;border-color:#3c5144}
+html[data-theme="dark"] :is(nav a,.breadcrumb,.chart-empty,.local-note,.activity-heading-link){color:#acbfb1}
+html[data-theme="dark"] :is(nav a.active,nav a:hover,.tab.active,.scenario-card.selected){background:#263c2e;color:#a6dfb6;border-color:#5d8c69}
+html[data-theme="dark"] :is(.button,.source-select,.search,.field input,.field select,.field textarea){background:#1c2b22;color:#dce9df;border-color:#45604f}
+html[data-theme="dark"] .button:hover{background:#2b4032;border-color:#86b394}
+html[data-theme="dark"] .button.primary{background:#8cdab0;color:#10251a;border-color:#8cdab0}
+html[data-theme="dark"] .button.danger{background:#452a29;color:#ffc1ba;border-color:#83504b}
+html[data-theme="dark"] :is(thead,.feed-strip,.callout,.live-db){background:#1c3025;border-color:#3a5542;color:#bbd1bf}
+html[data-theme="dark"] :is(th,td){border-color:#30433a;color:#bacbbe}
+html[data-theme="dark"] tbody tr:hover{background:#22342a}
+html[data-theme="dark"] .positive{color:#8cdda9}html[data-theme="dark"] .negative{color:#ff9791}
+html[data-theme="dark"] :is(.tag.success,.activity-mark){background:#22442f;color:#a0e5b5}
+html[data-theme="dark"] :is(.tag.warning,.callout.warning,.demo-banner){background:#3c3021;color:#f0c48c;border-color:#6c5435}
+html[data-theme="dark"] :is(.tag.error,.banner-error,.activity-item.error .activity-mark){background:#432a28;color:#ffb3a8;border-color:#74443e}
+html[data-theme="dark"] :is(.activity-item,.log-row,.file-link,.modal-head,.chart-footer,.table-bottom,.workspace,.account,.topbar,.sidebar-bottom,.rule-box){border-color:#30433a}
+html[data-theme="dark"] .rule-box{background:#1a281f}
+html[data-theme="dark"] :is(.venue-icon,.asset-icon){background:#2c382a;color:#dbd6a4}
+html[data-theme="dark"] :is(.venue-icon.lm,.asset-icon.eth){background:#2b3044;color:#b8bdf5}
+html[data-theme="dark"] .chart-wrap svg text{fill:#adbeaf}html[data-theme="dark"] .chart-wrap svg line{stroke:#33483a}
+html[data-theme="dark"] .tab{color:#a9bdaf}html[data-theme="dark"] .dot{background:#91d7a0}
+html[data-theme="dark"] #toast{background:#345840;color:#effcef}html[data-theme="dark"] #toast.error{background:#74413a}
+@media(max-width:620px){.theme-toggle{font-size:10px;padding:6px 8px}.topbar-right .paper-badge{display:none}.top-ten .market-title{max-width:260px}.live-db{font-size:11px}}
+.panel-heading{flex-wrap:wrap;gap:10px}
+.panel-heading .tag{white-space:normal}

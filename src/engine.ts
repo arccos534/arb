@@ -5,6 +5,7 @@ import type { Book, Evaluation, FeeModel, Pair } from './domain.js';
 import type { BookCache } from './books.js';
 import { limitlessFeeRate, limitlessFeeAssumption } from './limitless-fees.js';
 import { identityBlockers } from './matching.js';
+import { orderedLevels } from './book-levels.js';
 
 Decimal.set({ precision: 40, rounding: Decimal.ROUND_HALF_UP });
 
@@ -31,7 +32,7 @@ export function quoteBuy(book: Book, targetNet: string, fee: FeeModel): BuyQuote
   let gross = new Decimal(0), contractFee = new Decimal(0);
   let principal = new Decimal(0), cashFee = new Decimal(0), worst = new Decimal(0);
   const feeLevels: BuyQuote['feeLevels'] = [];
-  for (const level of [...book.asks].sort((a, b) => new Decimal(a.price).comparedTo(b.price))) {
+  for (const level of orderedLevels(book.asks, true)) {
     const price = new Decimal(level.price);
     const rate = fee.kind === 'limitless-curve' ? limitlessFeeRate('buy', price) : fee.kind === 'contracts-bound' ? new Decimal(fee.rate) : new Decimal(0);
     const retention = new Decimal(1).minus(rate);
